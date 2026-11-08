@@ -135,7 +135,7 @@
 | Wi-Fi | 高通 WCN7860 / ath12k | ✅ 可用 | 2.4 GHz 与 5 GHz 80 MHz 连接稳定 |
 | 蓝牙 | 高通 WCN7860 / `hci_qca` | ✅ 可用 | 配对、文件传输和蓝牙音频可用 |
 | USB 设备模式 | USB 3 / 5 Gbit/s 网络（NCM） | ✅ 可用 | 开发者模式下经 USB 线 SSH 登录，默认关闭 |
-| USB 主机 / OTG | Type-C 角色切换 / USB 3 / 5 Gbit/s | 🟡 部分支持 | U 盘、键鼠、扩展坞可用，正反插 5 Gbit/s；拔出 OTG 设备后直接重插转接头可能不被识别 |
+| USB 主机 / OTG | Type-C 角色切换 / USB 3 / 5 Gbit/s | 🟡 部分支持 | U 盘、键鼠、扩展坞可用，正反插 5 Gbit/s；拔出 OTG 设备后直接重插转接头可能不被识别。s2idle 恢复后，当前锁定的内核可能报 Host System Error 并丢掉仍插着的外设；`kernel/patches/0001-usb-dwc3-host-resume-reenumerate.patch` 会复位该主机以便重新枚举。此补丁不在锁定的 7.2.15-piano58 提交里，装进可安装内核前须先进入内核树并分配新的 ABI |
 | USB-C 外接显示 | DisplayPort Alt Mode | ✅ 可用 | 正反插、热插拔，实测 4K 60 Hz，扩展桌面 |
 
 ### 音视频与传感器
@@ -148,7 +148,7 @@
 | 视频硬编 | 高通 Iris / V4L2 | ✅ 可用 | H.264/H.265 1080p、4K 编码已验证 |
 | 摄像头 | 后摄 S5KJN1SQ03、前摄 OV32D40 | ✅ 可用 | 前后摄像头可在相机应用中使用；后摄固定焦距，适合非近距离拍摄 |
 | 加速度、陀螺、光感、距离 | SSC / hexagonrpcd / libssc | ✅ 可用 | SensorProxy 可报告方向和环境光 |
-| 自动旋转 | SensorProxy / Mutter | ✅ 可用 | 拆下键盘后自动旋转；装着键盘时按 GNOME 规则锁定 |
+| 自动旋转 | SensorProxy / Mutter | ✅ 可用 | 拆下键盘后自动旋转；装着键盘时按 GNOME 规则锁定。Mutter 50.1 在会话已经处于平板模式时不会声明加速度计，因此 `piano-session-sensors` 代为声明并设置逻辑旋转。须在真机确认 |
 
 Firefox 播放部分 HEVC 视频可能有轻微丢帧。Chromium snap 不支持此硬解集成。
 

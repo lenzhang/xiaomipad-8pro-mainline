@@ -1,0 +1,179 @@
+From: Piano mainline integration <noreply@localhost>
+Subject: [PATCH] usb: dwc3: re-enumerate the host after system resume
+
+Piano's Type-C controller is an OTG DWC3 without wakeup-source. System
+suspend therefore calls dwc3_core_exit() after xHCI has saved its
+registers, and an attached peripheral often leaves the HS PHY out of L2
+before dwc3-qcom gates the glue clocks. On resume xHCI restores that
+saved context onto a reset core. The host raises STS_FATAL (Host System
+Error), the port reset fails with -ESHUTDOWN, and the Type-C partner
+stays powered in host/source mode, so the peripheral never disconnects.
+
+Unbinding xHCI does not re-init the PHY. Unbinding dwc3-qcom drops the
+role switch and the OTG probe default becomes device mode, which starts
+a gadget instead of enumerating the attached device.
+
+Remember the loss when the core is reinitialised or the HS PHY was not
+in L2, program the host PHY mode again, and tell the xHCI platform
+device that power was lost. xhci_resume() then resets the controller
+and the root hub enumerates the devices that are still attached.
+
+---
+diff --git a/drivers/usb/dwc3/core.c b/drivers/usb/dwc3/core.c
+index ceb49f2f..7c9c3200 100644
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -2568,6 +2568,19 @@ static int dwc3_resume_common(struct dwc3 *dwc, pm_message_t msg)
+ 			if (ret)
+ 				return ret;
+ 			dwc3_set_prtcap(dwc, DWC3_GCTL_PRTCAP_HOST, true);
++			/*
++			 * The xHCI child already saved its context, then this
++			 * core was powered off. Restoring that context faults
++			 * the host (STS_FATAL / Host System Error) and the
++			 * attached device never sees a disconnect. Mark the
++			 * loss so xHCI resets and the root hub enumerates again,
++			 * and re-apply the host PHY mode phy_exit cleared.
++			 */
++			dwc->resume_host_lost_power = true;
++			for (i = 0; i < dwc->num_usb2_ports; i++)
++				phy_set_mode(dwc->usb2_generic_phy[i], PHY_MODE_USB_HOST);
++			for (i = 0; i < dwc->num_usb3_ports; i++)
++				phy_set_mode(dwc->usb3_generic_phy[i], PHY_MODE_USB_HOST);
+ 			break;
+ 		}
+ 		/* Restore GUSB2PHYCFG bits that were modified in suspend */
+diff --git a/drivers/usb/dwc3/core.h b/drivers/usb/dwc3/core.h
+index bb58bf29..25120628 100644
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -1179,6 +1179,8 @@ struct dwc3_glue_ops {
+  * @enable_usb2_transceiver_delay: Set to insert a delay before the
+  *			assertion of the TxValid signal during a HS Chirp.
+  * @sys_wakeup: set if the device may do system wakeup.
++ * @resume_host_lost_power: the host registers or the HS link cannot be
++ *	restored across this system suspend; xHCI must reset and re-enumerate.
+  * @wakeup_configured: set if the device is configured for remote wakeup.
+  * @suspended: set to track suspend event due to U3/L2.
+  * @susphy_state: state of DWC3_GUSB2PHYCFG_SUSPHY + DWC3_GUSB3PIPECTL_SUSPHY
+@@ -1431,6 +1433,7 @@ struct dwc3 {
+ 	unsigned		enable_usb2_transceiver_delay:1;
+ 	unsigned		async_callbacks:1;
+ 	unsigned		sys_wakeup:1;
++	unsigned		resume_host_lost_power:1;
+ 	unsigned		wakeup_configured:1;
+ 	unsigned		suspended:1;
+ 	unsigned		susphy_state:1;
+diff --git a/drivers/usb/dwc3/dwc3-qcom.c b/drivers/usb/dwc3/dwc3-qcom.c
+index ad298793..37f7336d 100644
+--- a/drivers/usb/dwc3/dwc3-qcom.c
++++ b/drivers/usb/dwc3/dwc3-qcom.c
+@@ -834,6 +834,33 @@ static void dwc3_qcom_remove(struct platform_device *pdev)
+ 	pm_runtime_put_noidle(qcom->dev);
+ }
+ 
++/* True when a host port is still active, so gating clocks invalidates xHCI. */
++static bool dwc3_qcom_host_not_in_l2(struct dwc3_qcom *qcom)
++{
++	int i;
++
++	if (!dwc3_qcom_is_host(qcom))
++		return false;
++
++	for (i = 0; i < qcom->num_ports; i++) {
++		u32 val = readl(qcom->qscratch_base + pwr_evnt_irq_stat_reg[i]);
++
++		if (!(val & PWR_EVNT_LPM_IN_L2_MASK))
++			return true;
++	}
++	return false;
++}
++
++static void dwc3_qcom_restore_host_phy_mode(struct dwc3 *dwc)
++{
++	int i;
++
++	for (i = 0; i < dwc->num_usb2_ports; i++)
++		phy_set_mode(dwc->usb2_generic_phy[i], PHY_MODE_USB_HOST);
++	for (i = 0; i < dwc->num_usb3_ports; i++)
++		phy_set_mode(dwc->usb3_generic_phy[i], PHY_MODE_USB_HOST);
++}
++
+ static int dwc3_qcom_pm_suspend(struct device *dev)
+ {
+ 	struct dwc3 *dwc = dev_get_drvdata(dev);
+@@ -847,9 +874,19 @@ static int dwc3_qcom_pm_suspend(struct device *dev)
+ 	 */
+ 	guard(mutex)(&qcom->role_lock);
+ 
++	/*
++	 * Read while the glue clocks are still on. An attached peripheral
++	 * often never reaches L2; suspend cuts those clocks anyway, and a
++	 * later context restore raises Host System Error.
++	 */
++	if (dwc3_qcom_host_not_in_l2(qcom))
++		dwc->resume_host_lost_power = true;
++
+ 	ret = dwc3_pm_suspend(&qcom->dwc);
+-	if (ret)
++	if (ret) {
++		dwc->resume_host_lost_power = false;
+ 		return ret;
++	}
+ 
+ 	ret = dwc3_qcom_suspend(qcom, wakeup);
+ 	if (ret)
+@@ -879,6 +916,8 @@ static int dwc3_qcom_pm_resume(struct device *dev)
+ 
+ 	qcom->pm_suspended = false;
+ 	ret = dwc3_pm_resume(&qcom->dwc);
++	if (!ret && qcom->dwc.resume_host_lost_power && dwc3_qcom_is_host(qcom))
++		dwc3_qcom_restore_host_phy_mode(&qcom->dwc);
+ 
+ 	/*
+ 	 * Apply a VBUS override update from a role switch that came in while
+diff --git a/drivers/usb/dwc3/host.c b/drivers/usb/dwc3/host.c
+index 96b588bd..812b21dd 100644
+--- a/drivers/usb/dwc3/host.c
++++ b/drivers/usb/dwc3/host.c
+@@ -77,8 +77,40 @@ static void dwc3_xhci_plat_start(struct usb_hcd *hcd)
+ 	dwc3_enable_susphy(dwc, true);
+ }
+ 
++static struct dwc3 *dwc3_xhci_parent(struct usb_hcd *hcd)
++{
++	struct device *parent = hcd->self.controller->parent;
++
++	if (!parent)
++		return NULL;
++	return dev_get_drvdata(parent);
++}
++
++static int dwc3_xhci_resume_quirk(struct usb_hcd *hcd)
++{
++	struct dwc3 *dwc = dwc3_xhci_parent(hcd);
++
++	if (dwc && dwc->resume_host_lost_power) {
++		dev_info(dwc->dev, "xHCI lost host context; resetting and re-enumerating\n");
++		hcd_to_xhci_priv(hcd)->power_lost = true;
++	}
++	return 0;
++}
++
++static int dwc3_xhci_post_resume_quirk(struct usb_hcd *hcd)
++{
++	struct dwc3 *dwc = dwc3_xhci_parent(hcd);
++
++	if (dwc)
++		dwc->resume_host_lost_power = false;
++	hcd_to_xhci_priv(hcd)->power_lost = false;
++	return 0;
++}
++
+ static const struct xhci_plat_priv dwc3_xhci_plat_quirk = {
+ 	.plat_start = dwc3_xhci_plat_start,
++	.resume_quirk = dwc3_xhci_resume_quirk,
++	.post_resume_quirk = dwc3_xhci_post_resume_quirk,
+ };
+ 
+ static void dwc3_host_fill_xhci_irq_res(struct dwc3 *dwc,

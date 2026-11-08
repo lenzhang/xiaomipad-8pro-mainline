@@ -1,0 +1,455 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: MIT
+"""Keep piano orientation and auto-brightness subscribed on GNOME 50.
+
+Mutter 50.1 calls uninhibit_tracking() when HasAccelerometer becomes true
+while the seat is already in tablet mode. That runs before any orientation
+sample has pushed the matching inhibit, so the inhibit counter goes negative
+and ClaimAccelerometer is never issued. monitor-sensor can still claim later;
+the shell does not.
+
+gnome-settings-daemon 50 claims the light sensor only from iio-sensor-proxy's
+name-appeared callback, and only if org.gnome.Shell.Brightness already reports
+HasBrightnessControl. On this tablet the proxy is started by udev before the
+session, so that callback runs before the shell exports brightness and is not
+repeated.
+
+This process is the session client those two programs are not. It claims the
+accelerometer and applies Mutter's temporary logical-monitor transform, and it
+claims the light sensor and forwards the same smoothing target gsd-power would.
+It does nothing on another machine or desktop. Claims are released across system
+sleep so the sensors are not held through s2idle.
+"""
+import os
+from pathlib import Path
+import sys
+
+WORD_BITS = 64
+ORIENTATION = {'normal': 0, 'left-up': 1, 'bottom-up': 2, 'right-up': 3}
+# Linux input capability bit positions.
+SW_TABLET_MODE = 1
+ABS_MT_POSITION_X = 0x35
+REL_X = 0x00
+INPUT_PROP_POINTER = 0x00
+INPUT_PROP_DIRECT = 0x01
+# Same ioctl numbers as piano-sensors-check: EVIOCGBIT(EV_SW, 8), EVIOCGSW(8).
+EVIOCGBIT_SW8 = 0x80084525
+EVIOCGSW8 = 0x8008451b
+# gsd-power ambient filter, in microseconds.
+AMBIENT_TIME_CONSTANT = 1_000_000 / (2 * 3.141592653589793 * 0.1)
+AMBIENT_SEND_INTERVAL = 100_000
+AMBIENT_NORMALIZE = 1.5
+TEMPORARY = 1
+
+
+def bitmap_has(text, bit, word_bits=WORD_BITS):
+    words = (text or '').split()
+    if not words or bit < 0:
+        return False
+    index = bit // word_bits
+    if index >= len(words):
+        return False
+    word = int(words[len(words) - 1 - index], 16)
+    return bool((word >> (bit % word_bits)) & 1)
+
+
+def classify_device(props, abs_bits, rel_bits, sw_bits):
+    direct = bitmap_has(props, INPUT_PROP_DIRECT)
+    pointer = bitmap_has(props, INPUT_PROP_POINTER)
+    return {
+        'touchscreen': direct and bitmap_has(abs_bits, ABS_MT_POSITION_X) and not pointer,
+        'pointer': pointer and not direct and (bitmap_has(rel_bits, REL_X) or bitmap_has(abs_bits, ABS_MT_POSITION_X)),
+        'tablet_switch': bitmap_has(sw_bits, SW_TABLET_MODE),
+    }
+
+
+def touch_mode(devices):
+    """Mutter's seat rule. None if the seat is not visible or a switch is unreadable."""
+    if not devices or not any(device['touchscreen'] for device in devices):
+        if not devices:
+            return None
+        return False
+    switches = [device for device in devices if device['tablet_switch']]
+    if switches:
+        if any(device.get('switch_on') is None for device in switches):
+            return None
+        return any(device['switch_on'] for device in switches)
+    return not any(device['pointer'] for device in devices)
+
+
+def desired_transform(mode, locked, orientation):
+    """Return a transform, or None to leave the current one alone."""
+    if mode is None:
+        return None
+    if not mode:
+        return 0
+    if locked:
+        return None
+    return ORIENTATION.get(orientation)
+
+
+def current_mode_id(modes):
+    for mode in modes:
+        if mode[-1].get('is-current'):
+            return mode[0]
+    return modes[0][0] if modes else None
+
+
+def builtin_connectors(monitors):
+    return {ident[0] for ident, _modes, props in monitors if props.get('is-builtin')}
+
+
+def orientation_config(monitors, logical, transform):
+    """Copy the current config, changing only the builtin panel transform.
+
+    A single logical monitor is the panel when the driver does not mark it
+    built-in. Extra monitors keep their transform and position.
+    """
+    builtin = builtin_connectors(monitors)
+    if not builtin and len(logical) == 1 and logical[0][5]:
+        builtin = {logical[0][5][0][0]}
+    modes = {ident[0]: current_mode_id(mode_list) for ident, mode_list, _props in monitors}
+    changed = False
+    planned = []
+    for x, y, scale, current, primary, outputs, _props in logical:
+        connectors = [output[0] for output in outputs]
+        selected = transform if builtin and any(name in builtin for name in connectors) else current
+        if selected != current:
+            changed = True
+        if any(modes.get(name) is None for name in connectors):
+            return False, []
+        planned.append((x, y, float(scale), int(selected), bool(primary),
+                        [(name, modes[name], {}) for name in connectors]))
+    return changed, planned
+
+
+class Ambient:
+    """gsd-power's time-weighted auto-brightness target, as a fraction or None."""
+
+    def __init__(self):
+        self.norm_required = True
+        self.accumulator = -1.0
+        self.norm_value = None
+        self.last_time = 0
+        self.set_time = 0
+
+    def user_changed(self):
+        self.norm_required = True
+
+    def update(self, lux, now_us):
+        if lux is None or lux <= 0:
+            return None
+        if self.norm_required:
+            self.norm_value = lux * AMBIENT_NORMALIZE
+            if self.accumulator <= 0:
+                self.accumulator = 100.0 / AMBIENT_NORMALIZE
+            self.norm_required = False
+        if self.last_time:
+            alpha = 1.0 / (1.0 + (AMBIENT_TIME_CONSTANT / (now_us - self.last_time)))
+        else:
+            alpha = 0.0
+        self.last_time = now_us
+        brightness = min(100.0, max(0.0, lux * 100.0 / self.norm_value))
+        self.accumulator = (alpha * brightness) + ((1.0 - alpha) * self.accumulator)
+        if self.accumulator < 0 or now_us - self.set_time < AMBIENT_SEND_INTERVAL:
+            return None
+        self.set_time = now_us
+        return self.accumulator / 100.0
+
+
+def load_devices(sysfs, switch_state):
+    devices = []
+    root = Path(sysfs)
+    if not root.is_dir():
+        return devices
+    for event in sorted(path for path in root.iterdir() if path.name.startswith('event') and path.is_dir()):
+        device = event / 'device'
+        caps = device / 'capabilities'
+
+        def read(name, base=caps):
+            path = base / name
+            return path.read_text() if path.is_file() else ''
+
+        info = classify_device(read('properties', device), read('abs'), read('rel'), read('sw'))
+        info['name'] = event.name
+        info['switch_on'] = None
+        if info['tablet_switch']:
+            info['switch_on'] = switch_state(event.name)
+        if info['touchscreen'] or info['pointer'] or info['tablet_switch']:
+            devices.append(info)
+    return devices
+
+
+def read_switch_ioctl(name, dev='/dev/input'):
+    import fcntl
+    path = Path(dev) / name
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        caps = bytearray(8)
+        state = bytearray(8)
+        fcntl.ioctl(fd, EVIOCGBIT_SW8, caps, True)
+        if not (int.from_bytes(caps, sys.byteorder) & (1 << SW_TABLET_MODE)):
+            return None
+        fcntl.ioctl(fd, EVIOCGSW8, state, True)
+        return bool((int.from_bytes(state, sys.byteorder) >> SW_TABLET_MODE) & 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def piano_session():
+    if 'GNOME' not in os.environ.get('XDG_CURRENT_DESKTOP', '').split(':'):
+        return False
+    if os.environ.get('XDG_SESSION_TYPE') != 'wayland':
+        return False
+    compatible = Path('/sys/firmware/devicetree/base/compatible')
+    try:
+        text = compatible.read_bytes()
+    except OSError:
+        return False
+    return b'xiaomi,piano' in text.split(b'\0')
+
+
+def main():
+    if not piano_session():
+        return 0
+    from gi.repository import Gio, GLib
+
+    loop = GLib.MainLoop()
+    system = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    session = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    state = {
+        'sleeping': False,
+        'locked': False,
+        'ambient': False,
+        'has_brightness': False,
+        'orientation': None,
+        'touch': None,
+        'accel_claimed': False,
+        'light_claimed': False,
+        'applying': False,
+    }
+    ambient = Ambient()
+
+    def setting(schema, key, default=False):
+        source = Gio.SettingsSchemaSource.get_default()
+        if source is None or source.lookup(schema, True) is None:
+            return default, None
+        settings = Gio.Settings.new(schema)
+        return settings.get_boolean(key), settings
+
+    state['locked'], lock_settings = setting('org.gnome.settings-daemon.peripherals.touchscreen', 'orientation-lock')
+    state['ambient'], power_settings = setting('org.gnome.settings-daemon.plugins.power', 'ambient-enabled')
+
+    def log(message):
+        print(message, flush=True)
+
+    def sensor_call(method):
+        system.call_sync('net.hadess.SensorProxy', '/net/hadess/SensorProxy', 'net.hadess.SensorProxy',
+                         method, None, None, Gio.DBusCallFlags.NONE, 10000, None)
+
+    def cached(proxy, name):
+        value = proxy.get_cached_property(name) if proxy else None
+        return None if value is None else value.unpack()
+
+    def sync_claims(proxy):
+        touch = state['touch']
+        want_accel = touch is True and not state['locked'] and not state['sleeping']
+        want_light = (state['ambient'] and state['has_brightness'] and not state['sleeping'])
+        try:
+            if want_accel and not state['accel_claimed']:
+                sensor_call('ClaimAccelerometer')
+                state['accel_claimed'] = True
+                log('claimed accelerometer')
+            elif not want_accel and state['accel_claimed']:
+                sensor_call('ReleaseAccelerometer')
+                state['accel_claimed'] = False
+        except GLib.Error as error:
+            log(f'accelerometer claim: {error}')
+        try:
+            if want_light and not state['light_claimed']:
+                sensor_call('ClaimLight')
+                state['light_claimed'] = True
+                ambient.user_changed()
+                log('claimed light')
+            elif not want_light and state['light_claimed']:
+                sensor_call('ReleaseLight')
+                state['light_claimed'] = False
+        except GLib.Error as error:
+            log(f'light claim: {error}')
+        if proxy is not None and state['accel_claimed']:
+            state['orientation'] = cached(proxy, 'AccelerometerOrientation')
+        if not state['sleeping']:
+            apply_orientation()
+        if state['light_claimed'] and proxy is not None:
+            forward_light(cached(proxy, 'LightLevel'))
+
+    sensor = {'proxy': None}
+
+    def apply_orientation():
+        if state['applying']:
+            return
+        transform = desired_transform(state['touch'], state['locked'], state['orientation'])
+        if transform is None:
+            return
+        try:
+            unpacked = session.call_sync(
+                'org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig',
+                'org.gnome.Mutter.DisplayConfig', 'GetCurrentState', None,
+                GLib.VariantType('(ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})'),
+                Gio.DBusCallFlags.NONE, 10000, None).unpack()
+        except GLib.Error as error:
+            log(f'display state: {error}')
+            return
+        serial, monitors, logical, _props = unpacked
+        changed, planned = orientation_config(monitors, logical, transform)
+        if not changed:
+            return
+        state['applying'] = True
+        try:
+            session.call_sync(
+                'org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig',
+                'org.gnome.Mutter.DisplayConfig', 'ApplyMonitorsConfig',
+                GLib.Variant('(uua(iiduba(ssa{sv}))a{sv})', (serial, TEMPORARY, planned, {})),
+                None, Gio.DBusCallFlags.NONE, 10000, None)
+            log(f'logical transform {transform}')
+        except GLib.Error as error:
+            log(f'display config: {error}')
+        finally:
+            state['applying'] = False
+
+    def forward_light(lux):
+        target = ambient.update(lux, GLib.get_monotonic_time())
+        if target is None or not state['has_brightness']:
+            return
+        try:
+            session.call_sync(
+                'org.gnome.Shell.Brightness', '/org/gnome/Shell/Brightness',
+                'org.gnome.Shell.Brightness', 'SetAutoBrightnessTarget',
+                GLib.Variant('(d)', (target,)), None, Gio.DBusCallFlags.NONE, 10000, None)
+        except GLib.Error as error:
+            log(f'auto brightness: {error}')
+
+    def refresh_touch():
+        state['touch'] = touch_mode(load_devices('/sys/class/input', read_switch_ioctl))
+        sync_claims(sensor['proxy'])
+        return True
+
+    def changed_names(changed):
+        if changed is None:
+            return set()
+        unpacked = changed.unpack() if hasattr(changed, 'unpack') else changed
+        return set(unpacked)
+
+    def properties_changed(_proxy, changed, _invalidated):
+        names = changed_names(changed)
+        if 'AccelerometerOrientation' in names or 'HasAccelerometer' in names:
+            state['orientation'] = cached(sensor['proxy'], 'AccelerometerOrientation')
+            if not state['sleeping']:
+                apply_orientation()
+        if state['light_claimed'] and ('LightLevel' in names or 'HasAmbientLight' in names):
+            forward_light(cached(sensor['proxy'], 'LightLevel'))
+
+    def sensor_ready(proxy):
+        sensor['proxy'] = proxy
+        proxy.connect('g-properties-changed', properties_changed)
+        state['orientation'] = cached(proxy, 'AccelerometerOrientation')
+        sync_claims(proxy)
+
+    Gio.bus_watch_name(Gio.BusType.SYSTEM, 'net.hadess.SensorProxy', Gio.BusNameWatcherFlags.NONE,
+                       lambda *_args: sensor_ready(Gio.DBusProxy.new_for_bus_sync(
+                           Gio.BusType.SYSTEM, Gio.DBusProxyFlags.NONE, None,
+                           'net.hadess.SensorProxy', '/net/hadess/SensorProxy',
+                           'net.hadess.SensorProxy', None)),
+                       lambda *_args: sensor.__setitem__('proxy', None))
+
+    def brightness_changed(proxy, changed, _invalidated):
+        if 'HasBrightnessControl' in changed_names(changed):
+            state['has_brightness'] = bool(cached(proxy, 'HasBrightnessControl'))
+            sync_claims(sensor['proxy'])
+
+    def brightness_ready():
+        proxy = Gio.DBusProxy.new_for_bus_sync(
+            Gio.BusType.SESSION, Gio.DBusProxyFlags.DO_NOT_AUTO_START, None,
+            'org.gnome.Shell.Brightness', '/org/gnome/Shell/Brightness',
+            'org.gnome.Shell.Brightness', None)
+        state['has_brightness'] = bool(cached(proxy, 'HasBrightnessControl'))
+        state['brightness'] = proxy
+        proxy.connect('g-properties-changed', brightness_changed)
+        proxy.connect('g-signal', lambda _p, _s, name, _params: ambient.user_changed() if name == 'BrightnessChanged' else None)
+        sync_claims(sensor['proxy'])
+
+    Gio.bus_watch_name(Gio.BusType.SESSION, 'org.gnome.Shell.Brightness', Gio.BusNameWatcherFlags.NONE,
+                       lambda *_args: brightness_ready(), lambda *_args: state.update(has_brightness=False))
+
+    def on_lock(_settings, _key):
+        state['locked'] = lock_settings.get_boolean('orientation-lock')
+        sync_claims(sensor['proxy'])
+
+    def on_ambient(_settings, _key):
+        state['ambient'] = power_settings.get_boolean('ambient-enabled')
+        if state['ambient']:
+            ambient.user_changed()
+        sync_claims(sensor['proxy'])
+
+    if lock_settings is not None:
+        lock_settings.connect('changed::orientation-lock', on_lock)
+    if power_settings is not None:
+        power_settings.connect('changed::ambient-enabled', on_ambient)
+
+    def prepare_for_sleep(_connection, _sender, _path, _iface, _name, params):
+        state['sleeping'] = bool(params.unpack()[0])
+        if state['sleeping']:
+            log('releasing sensors for system sleep')
+        sync_claims(sensor['proxy'])
+
+    system.signal_subscribe('org.freedesktop.login1', 'org.freedesktop.login1.Manager',
+                            'PrepareForSleep', '/org/freedesktop/login1', None,
+                            Gio.DBusSignalFlags.NONE, prepare_for_sleep)
+
+    refresh_touch()
+    # Dock attach is an evdev switch, not a poll. Rescan when /dev/input changes
+    # and whenever a watched switch event arrives; the timeout only covers the
+    # first second in case the seat devices appear after this process.
+    GLib.timeout_add_seconds(1, lambda: refresh_touch() and False)
+    input_dir = Gio.File.new_for_path('/dev/input')
+    try:
+        monitor = input_dir.monitor_directory(Gio.FileMonitorFlags.NONE, None)
+        state['input_monitor'] = monitor
+        monitor.connect('changed', lambda *_args: (refresh_touch(), arm_switches()))
+    except GLib.Error as error:
+        log(f'input monitor: {error}')
+
+    watched = set()
+
+    def on_switch(fd, _condition):
+        try:
+            os.read(fd, 256)
+        except OSError:
+            return False
+        refresh_touch()
+        return True
+
+    def arm_switches():
+        for device in load_devices('/sys/class/input', lambda _name: None):
+            if not device['tablet_switch'] or device['name'] in watched:
+                continue
+            try:
+                fd = os.open('/dev/input/' + device['name'], os.O_RDONLY | os.O_NONBLOCK)
+            except OSError as error:
+                log(f'{device["name"]}: {error}')
+                continue
+            watched.add(device['name'])
+            GLib.io_add_watch(fd, GLib.IO_IN, on_switch)
+
+    arm_switches()
+    loop.run()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

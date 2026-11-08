@@ -127,7 +127,7 @@ sudo reboot
 看 GetCurrentState 的 **logical transform/宽高** 与实屏，不能只看物理 mode。
 若拆下键盘后仍 switch=0，先定位键盘 attach 消息/驱动；若 switch=1 但 managed=false，检查触控的
 `ID_INPUT_TOUCHSCREEN=1`、libinput `Capabilities: touch`、seat0 和 GNOME 日志，再核实际 Mutter 版本。
-若 managed=true 但不转，查锁、claim 错误及显示配置应用错误。脚本返回 0 只表示采集命令成功。
+若 managed=true 但不转，查锁、claim 错误及显示配置应用错误。Mutter 50.1 在会话启动时已经处于平板模式（键盘拆下，或没有指针设备）时，加速度计一旦出现就会把方向跟踪的 inhibit 计数减到 -1，因此永远不调用 ClaimAccelerometer。`piano-ubuntu-desktop` 的用户服务 `piano-session-sensors` 自己声明加速度计，并用 Mutter 的临时显示配置设置逻辑旋转；环境光同理，在 Shell 报告 `HasBrightnessControl` 之后声明。脚本返回 0 只表示采集命令成功。
 
 ## 精确卸载/回滚
 

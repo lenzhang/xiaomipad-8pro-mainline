@@ -365,7 +365,7 @@ def main():
     # fake-hwclock: the RTC cannot be set; it restores the time saved at shutdown or hourly.
     package('piano-ubuntu-desktop', desktop, 'resources (= 1.10.2-0ubuntu3.1+piano2), gnome-settings-daemon (= 50.0-1ubuntu1+piano1), gnome-settings-daemon-common (= 50.0-1ubuntu1+piano1), gnome-control-center (= 1:50.0-0ubuntu6+piano2), gnome-control-center-data (= 1:50.0-0ubuntu6+piano2), piano-mesa, piano-iris-vaapi (>= 0.1.0+git.f587b14-0piano4), gdm3, gnome-shell (>= 50), colord, colord-data, python3-gi, fake-hwclock, python3, console-setup, snapd, init-system-helpers, tuned-ppd (>= 2.25.1), showtime, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav',
             'Piano Ubuntu desktop defaults: graphics, clock without RTC, speaker up-mix and UCM, '
-            'GNOME Shell 50 on-screen keyboard guard',
+            'GNOME Shell 50 on-screen keyboard guard, sensor orientation and auto-brightness',
             '#!/bin/sh\nset -e\nif [ "$1" = configure ]; then\n'
             ' if ! grep -q "^CHASSIS=" /etc/machine-info 2>/dev/null; then\n'
             '  if [ ! -e /etc/machine-info ]; then\n'
@@ -375,15 +375,15 @@ def main():
             '  printf "CHASSIS=convertible\\n" >> /etc/machine-info\n'
             ' fi\n'
             ' deb-systemd-helper enable piano-firefox-snap-remove.service >/dev/null\n'
-            ' deb-systemd-helper --user enable piano-panel-srgb.service >/dev/null\nfi\n',
+            ' deb-systemd-helper --user enable piano-panel-srgb.service piano-session-sensors.service >/dev/null\nfi\n',
             prerm='#!/bin/sh\nset -e\nif [ "$1" = remove ]; then\n'
-                  ' deb-systemd-helper --user disable piano-panel-srgb.service >/dev/null\nfi\n',
+                  ' deb-systemd-helper --user disable piano-panel-srgb.service piano-session-sensors.service >/dev/null\nfi\n',
             postrm='#!/bin/sh\nset -e\nif [ "$1" = purge ]; then\n'
                    ' if [ -f /etc/machine-info ]; then\n'
                    '  sed -i \'/^CHASSIS=convertible$/d\' /etc/machine-info\n'
                    '  if [ ! -s /etc/machine-info ]; then rm -f /etc/machine-info; fi\n'
                    ' fi\n'
-                   ' deb-systemd-helper --user purge piano-panel-srgb.service >/dev/null\nfi\n',
+                   ' deb-systemd-helper --user purge piano-panel-srgb.service piano-session-sensors.service >/dev/null\nfi\n',
             conffiles=['/etc/apt/preferences.d/piano-resources', '/etc/apt/preferences.d/piano-power-button-lock', '/etc/tuned/piano-ppd.conf',
                        '/etc/xdg/mimeapps.list'],
             third_party=[(('usr/share/alsa/ucm2/*',),

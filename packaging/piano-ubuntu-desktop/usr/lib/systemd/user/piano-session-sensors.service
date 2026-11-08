@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Claim piano sensors for orientation and auto-brightness
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/piano/session-sensors
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=graphical-session.target

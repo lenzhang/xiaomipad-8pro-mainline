@@ -137,7 +137,7 @@ Not yet supported: stylus, fingerprint.
 | Wi-Fi | Qualcomm WCN7860 / ath12k | ✅ works | Stable 2.4 GHz and 5 GHz 80 MHz links |
 | Bluetooth | Qualcomm WCN7860 / `hci_qca` | ✅ works | Pairing, file transfer and audio work |
 | USB device mode | USB 3 / 5 Gbit/s networking (NCM) | ✅ works | SSH over the USB cable in developer mode, off by default |
-| USB host / OTG | Type-C role switching / USB 3 / 5 Gbit/s | 🟡 partial | USB sticks, keyboards, mice and docks work at 5 Gbit/s in both orientations; a plain OTG adapter may not be detected when re-plugged right after an OTG device is removed |
+| USB host / OTG | Type-C role switching / USB 3 / 5 Gbit/s | 🟡 partial | USB sticks, keyboards, mice and docks work at 5 Gbit/s in both orientations; a plain OTG adapter may not be detected when re-plugged right after an OTG device is removed. After s2idle the pinned kernel can raise Host System Error and drop an attached peripheral; `kernel/patches/0001-usb-dwc3-host-resume-reenumerate.patch` resets that host so it can enumerate again. It is not in the pinned 7.2.15-piano58 commit, so it needs a kernel-tree commit and a new ABI before an installable kernel carries it |
 | USB-C external display | DisplayPort Alt Mode | ✅ works | Both orientations and hot-plug; tested at 4K 60 Hz as an extended desktop |
 
 ### Audio, Video and Sensors
@@ -150,7 +150,7 @@ Not yet supported: stylus, fingerprint.
 | Video encoding | Qualcomm Iris / V4L2 | ✅ works | H.264/H.265 at 1080p and 4K verified |
 | Cameras | Rear S5KJN1SQ03, front OV32D40 | ✅ works | Front and rear cameras available in camera apps; fixed rear focus, suited to subjects beyond close range |
 | Accelerometer, gyro, light, proximity | SSC / hexagonrpcd / libssc | ✅ works | SensorProxy reports orientation and ambient light |
-| Auto-rotation | SensorProxy / Mutter | ✅ works | Rotates with the keyboard detached; locked by GNOME's rule while the keyboard is attached |
+| Auto-rotation | SensorProxy / Mutter | ✅ works | Rotates with the keyboard detached; locked by GNOME's rule while the keyboard is attached. Mutter 50.1 does not claim the accelerometer when the session is already in tablet mode, so `piano-session-sensors` claims it and applies the logical transform. Confirm on hardware |
 
 Some HEVC videos may drop a small number of frames in Firefox. Chromium snap is not covered by this acceleration integration.
 
